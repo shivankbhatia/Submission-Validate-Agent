@@ -31,8 +31,8 @@ def check_ollama_running():
 
 
 def check_model_available():
-    """Check if llama3.1:8b model is available"""
-    print("\nChecking if llama3.1:8b model is downloaded...")
+    """Check if llama3.2:3b model is available"""
+    print("\nChecking if llama3.2:3b model is downloaded...")
 
     try:
         response = requests.get("http://localhost:11434/api/tags", timeout=5)

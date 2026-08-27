@@ -21,6 +21,33 @@ data_lock = threading.Lock()
 DATA_FILE = os.path.join("data_management", "data.csv")
 
 
+def normalize_roll_number(roll: str) -> str:
+    """Standardizes roll numbers by removing .0 and stripping whitespace."""
+    if not roll or not isinstance(roll, str):
+        return str(roll or "").strip()
+    return str(roll).strip().replace(".0", "")
+
+
+def normalize_link(link: str) -> str:
+    """Strips protocol, www, trailing slashes and query params for comparison."""
+    if not link:
+        return ""
+    l = str(link).lower().strip()
+    # Remove protocol
+    if "://" in l:
+        l = l.split("://")[1]
+    # Remove www.
+    if l.startswith("www."):
+        l = l[4:]
+    # Remove query parameters
+    l = l.split("?")[0]
+    # Remove trailing slash
+    if l.endswith("/"):
+        l = l[:-1]
+    return l
+
+
+
 def initialize_data_file():
     """
     Initialize data.csv with proper column structure if it doesn't exist.
@@ -110,10 +137,11 @@ def initialize_data_file():
         df = df.sort_values("Roll Number")
         df.to_csv(DATA_FILE, index=False)
         print(f"[OK] Initialized {DATA_FILE} with sample data")
-    else:
         # File exists - clean up duplicate columns if any
         try:
             df = pd.read_csv(DATA_FILE, dtype={"Roll Number": str})
+            df["Roll Number"] = df["Roll Number"].apply(normalize_roll_number)
+
 
             # Remove duplicate columns
             columns_to_remove = ["Name", "Coursera Certificate Link"]
@@ -189,8 +217,8 @@ def add_submission(roll_number: str, name: str, email: str, coursera_link: str,
             # Append new entry
             df = pd.concat([df, pd.DataFrame([new_entry])], ignore_index=True)
 
-            # Ensure Roll Number is string type before sorting
-            df["Roll Number"] = df["Roll Number"].astype(str)
+            # Ensure Roll Number is string type and normalized before sorting
+            df["Roll Number"] = df["Roll Number"].apply(normalize_roll_number)
 
             # Sort by roll number
             df = df.sort_values("Roll Number")
@@ -218,7 +246,7 @@ def get_all_submissions() -> pd.DataFrame:
         initialize_data_file()
 
     df = pd.read_csv(DATA_FILE, dtype={"Roll Number": str})
-    df["Roll Number"] = df["Roll Number"].astype(str)
+    df["Roll Number"] = df["Roll Number"].apply(normalize_roll_number)
     return df.sort_values("Roll Number")
 
 
@@ -260,7 +288,7 @@ def check_duplicate_submission(roll_number: str, coursera_link: str,
         return False
 
     # Ensure Roll Number is string and get sorted list
-    df["Roll Number"] = df["Roll Number"].astype(str)
+    df["Roll Number"] = df["Roll Number"].apply(normalize_roll_number)
     df = df.sort_values("Roll Number").reset_index(drop=True)
 
     # Binary search for roll number
@@ -284,18 +312,32 @@ def check_duplicate_submission(roll_number: str, coursera_link: str,
     if first_match == -1:
         return False
 
-    # Check all entries with matching roll number
-    # (there could be multiple submissions from same student)
-    # Use correct column names
+    # Normalize input links for comparison
+    norm_coursera = normalize_link(coursera_link)
+    norm_linkedin = normalize_link(linkedin_link)
+
     coursera_col = "Coursera completion certificate link"
     linkedin_col = "LinkedIn Post Link"
 
     idx = first_match
     while idx < len(df) and df.loc[idx, "Roll Number"] == roll_number:
-        # Check if both links match
-        if (df.loc[idx, coursera_col] == coursera_link and
-            df.loc[idx, linkedin_col] == linkedin_link):
+        existing_coursera = normalize_link(df.loc[idx, coursera_col])
+        existing_linkedin = normalize_link(df.loc[idx, linkedin_col])
+        existing_status = str(df.loc[idx, "Status"]).strip().upper()
+
+        # 1. Match for either link (blocked if already passed or duplicate)
+        # Students shouldn't reuse certificates OR LinkedIn posts for the same roll number
+        if existing_coursera == norm_coursera:
+            # If they already passed this specific certificate, it's a hard duplicate
+            if existing_status == "PASS":
+                return True
+            # If it's the exact same link and post, it's also a duplicate
+            if existing_linkedin == norm_linkedin:
+                return True
+            
+        if existing_linkedin == norm_linkedin and existing_status == "PASS":
             return True
+            
         idx += 1
 
     return False
@@ -337,7 +379,8 @@ def get_cached_evaluation_results(roll_number: str) -> Optional[Dict]:
         return None
 
     df = pd.read_csv(DATA_FILE, dtype={"Roll Number": str})
-    df["Roll Number"] = df["Roll Number"].astype(str)
+    df["Roll Number"] = df["Roll Number"].apply(normalize_roll_number)
+
 
     # Get all entries for this roll number
     matches = df[df["Roll Number"] == roll_number]
@@ -384,16 +427,27 @@ def get_cached_result_for_submission(roll_number: str, coursera_link: str,
         return None
 
     df = pd.read_csv(DATA_FILE, dtype={"Roll Number": str})
-    df["Roll Number"] = df["Roll Number"].astype(str)
+    df["Roll Number"] = df["Roll Number"].apply(normalize_roll_number)
+
 
     coursera_col = "Coursera completion certificate link"
     linkedin_col = "LinkedIn Post Link"
 
     # Find exact match by roll number and both links
+    # Find match by normalized roll number and both links
+    # This is more expensive but robust
+    df["Norm_Roll"] = df["Roll Number"].apply(normalize_roll_number)
+    df["Norm_Coursera"] = df[coursera_col].apply(normalize_link)
+    df["Norm_Linkedin"] = df[linkedin_col].apply(normalize_link)
+
+    norm_roll = normalize_roll_number(roll_number)
+    norm_coursera = normalize_link(coursera_link)
+    norm_linkedin = normalize_link(linkedin_link)
+
     matches = df[
-        (df["Roll Number"] == roll_number) &
-        (df[coursera_col] == coursera_link) &
-        (df[linkedin_col] == linkedin_link)
+        (df["Norm_Roll"] == norm_roll) &
+        (df["Norm_Coursera"] == norm_coursera) &
+        (df["Norm_Linkedin"] == norm_linkedin)
     ]
 
     if matches.empty:
@@ -461,16 +515,26 @@ def save_evaluation_result(roll_number: str, name: str, email: str,
                 initialize_data_file()
 
             df = pd.read_csv(DATA_FILE, dtype={"Roll Number": str})
-            df["Roll Number"] = df["Roll Number"].astype(str)
+            df["Roll Number"] = df["Roll Number"].apply(normalize_roll_number)
+
 
             coursera_col = "Coursera completion certificate link"
             linkedin_col = "LinkedIn Post Link"
 
             # Check if this exact submission already exists
+            # Check if this exact submission already exists using normalized matching
+            df["Norm_Roll"] = df["Roll Number"].apply(normalize_roll_number)
+            df["Norm_Coursera"] = df[coursera_col].apply(normalize_link)
+            df["Norm_Linkedin"] = df[linkedin_col].apply(normalize_link)
+
+            norm_roll = normalize_roll_number(roll_number)
+            norm_coursera = normalize_link(coursera_link)
+            norm_linkedin = normalize_link(linkedin_link)
+
             matching_rows = df[
-                (df["Roll Number"] == roll_number) &
-                (df[coursera_col] == coursera_link) &
-                (df[linkedin_col] == linkedin_link)
+                (df["Norm_Roll"] == norm_roll) &
+                (df["Norm_Coursera"] == norm_coursera) &
+                (df["Norm_Linkedin"] == norm_linkedin)
             ]
 
             now = datetime.now()
@@ -517,6 +581,9 @@ def save_evaluation_result(roll_number: str, name: str, email: str,
 
             # Sort by roll number
             df = df.sort_values("Roll Number")
+
+            # Drop normalization columns before saving
+            df = df.drop(columns=["Norm_Roll", "Norm_Coursera", "Norm_Linkedin"], errors='ignore')
 
             # Save to file
             df.to_csv(DATA_FILE, index=False)

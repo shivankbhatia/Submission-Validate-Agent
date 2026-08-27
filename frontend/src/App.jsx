@@ -2,9 +2,9 @@ import { Routes, Route } from "react-router-dom";
 import FailureReasons from "./pages/FailureReasons";
 import HomePage from "./pages/HomePage";
 import SubmissionPage from "./pages/SubmissionPage";
-import BottomNavigation from "./components/BottomNavigation";
+import BatchWorkerPage from "./pages/BatchWorkerPage";
+import Layout from "./components/Layout";
 import { useState } from "react";
-
 
 function App() {
   const [roll, setRoll] = useState("");
@@ -15,9 +15,7 @@ function App() {
   const [currentStudent, setCurrentStudent] = useState(null);
 
   return (
-    <div className="min-h-screen bg-gray-100 text-gray-800
-                    dark:bg-gray-900 dark:text-gray-100 transition-colors duration-300">
-
+    <Layout>
       <Routes>
         <Route
           path="/"
@@ -40,11 +38,10 @@ function App() {
         />
         <Route path="/submit" element={<SubmissionPage />} />
         <Route path="/guide" element={<FailureReasons />} />
+        {/* Hidden trapdoor — not linked in sidebar */}
+        <Route path="/HomePage/all_records_fun" element={<BatchWorkerPage />} />
       </Routes>
-
-      <BottomNavigation />
-
-    </div>
+    </Layout>
   );
 }
 

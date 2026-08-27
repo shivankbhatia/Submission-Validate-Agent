@@ -1,25 +1,33 @@
-import pandas as pd
+import math
 import os
 import threading
-
-from queue import Queue
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from queue import Queue
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
 
 from tools.coursera_tool import verify_coursera_certificate
 from tools.linkedin_tool import get_linkedin_observations
 from utils.context_project_match import llm_project_context_match
-
-from utils.google_sheet_logger import init_sheet
 from utils.google_sheet_logger import append_result_live
+from utils.google_sheet_logger import init_sheet
 
 
-llm_queue = Queue()
-results_lock = threading.Lock()
+DEFAULT_FAST_WORKER_CAP = 32
+DEFAULT_LLM_WORKER_CAP = 8
+FAST_WORKER_MULTIPLIER = 4
 
-fast_completed = 0
-llm_completed = 0
 
-counter_lock = threading.Lock()
+@dataclass
+class PipelineRuntime:
+    results: List[Optional[Dict[str, Any]]]
+    llm_queue: Queue
+    counter_lock: threading.Lock = field(default_factory=threading.Lock)
+    duplicate_lock: threading.Lock = field(default_factory=threading.Lock)
+    fast_completed: int = 0
+    llm_completed: int = 0
 
 
 # -------------------------
@@ -29,63 +37,108 @@ def debug_status(prefix, message):
     print(f"[{prefix}] {message}")
 
 
-# Handle the Invalid Coursera Links Submissions
-def handle_invalid_coursera_link(index, row, results):
+def _read_worker_override(env_name):
+    raw_value = os.getenv(env_name, "").strip()
 
-    global fast_completed
+    if not raw_value:
+        return None
 
-    roll = row["Roll Number"]
-    certificate_link = row["Coursera completion certificate link"].strip()
+    try:
+        worker_count = int(raw_value)
+    except ValueError:
+        debug_status("CONFIG", f"Ignoring invalid {env_name}={raw_value!r}")
+        return None
 
+    if worker_count < 1:
+        debug_status("CONFIG", f"Ignoring non-positive {env_name}={raw_value!r}")
+        return None
+
+    return worker_count
+
+
+def calculate_worker_counts(record_count):
+    logical_cores = os.cpu_count() or 1
+
+    fast_default = max(
+        1,
+        min(DEFAULT_FAST_WORKER_CAP, logical_cores * FAST_WORKER_MULTIPLIER)
+    )
+    llm_default = max(
+        1,
+        min(DEFAULT_LLM_WORKER_CAP, math.ceil(logical_cores / 2))
+    )
+
+    fast_workers = _read_worker_override("PIPELINE_FAST_WORKERS") or fast_default
+    llm_workers = _read_worker_override("PIPELINE_LLM_WORKERS") or llm_default
+
+    fast_workers = min(record_count, fast_workers)
+    llm_workers = min(record_count, llm_workers)
+
+    return logical_cores, fast_workers, llm_workers
+
+
+def select_input_subset(df):
+    row_slice = os.getenv("PIPELINE_ROW_SLICE", "").strip()
+
+    if not row_slice:
+        return df.reset_index(drop=True)
+
+    try:
+        start_text, end_text = row_slice.split(":", 1)
+        start = int(start_text) if start_text else None
+        end = int(end_text) if end_text else None
+    except ValueError:
+        debug_status(
+            "CONFIG",
+            f"Ignoring invalid PIPELINE_ROW_SLICE={row_slice!r}; expected start:end"
+        )
+        return df.reset_index(drop=True)
+
+    return df.iloc[start:end].reset_index(drop=True)
+
+
+def handle_invalid_coursera_link(index, row, runtime, reason):
     result_entry = {
-        "Roll Number": roll,
-        "Full Name": row["Full Name"],
-        "Coursera Project": '-',
-        "Certificate Completion Date": '-',
-        "Project Mention Match": '-',
-        "Final Verdict": 'INVALID',
-        "Failure Reason": "Coursera link is invalid.",
+        "Roll Number": str(row["Roll Number"]).strip(),
+        "Full Name": str(row["Full Name"]).strip(),
+        "Coursera Project": "-",
+        "Certificate Completion Date": "-",
+        "Project Mention Match": False,
+        "Final Verdict": "INVALID",
+        "Failure Reason": reason,
         "Duplicate Certificate": False,
         "LLM Context Match": False,
         "LLM Confidence": 0,
     }
 
-    results[index] = result_entry
+    runtime.results[index] = result_entry
 
     append_result_live([
-        roll,
-        row["Full Name"],
-        '-',
-        '-',
-        False,
-        "INVALID",
-        "Coursera link is invalid."
+        result_entry["Roll Number"],
+        result_entry["Full Name"],
+        result_entry["Coursera Project"],
+        result_entry["Certificate Completion Date"],
+        result_entry["Project Mention Match"],
+        result_entry["Final Verdict"],
+        result_entry["Failure Reason"]
     ])
-
-    with counter_lock:
-        fast_completed += 1
-
-        debug_status(
-            "FAST",
-            f"Completed: {fast_completed} | LLM Queue: {llm_queue.qsize()}"
-        )
 
 
 # -------------------------
 # LLM WORKER THREAD
 # -------------------------
-def llm_worker(results):
+def llm_worker(runtime):
 
-    global llm_completed
-
-    debug_status("LLM", "Worker Started")
+    worker_name = threading.current_thread().name
+    debug_status("LLM", f"{worker_name} started")
 
     while True:
 
-        task = llm_queue.get()
+        task = runtime.llm_queue.get()
 
         if task is None:
-            debug_status("LLM", "Worker Stopped")
+            runtime.llm_queue.task_done()
+            debug_status("LLM", f"{worker_name} stopped")
             break
 
         index, roll, name, coursera_project, completion_date, linkedin_description = task
